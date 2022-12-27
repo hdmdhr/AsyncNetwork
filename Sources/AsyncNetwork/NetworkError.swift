@@ -12,5 +12,14 @@ public enum NetworkError: Error {
     case urlError(URLError)
     /// Case wrapping Swift native `DecodingError`
     case decoding(DecodingError)
-    case cannotAuthorize(data: Data?, urlResponse: URLResponse?)
+}
+
+public extension NetworkError {
+    
+    enum Authorization: Error {
+        case reachedMaxRetryLimit
+        case expiredRefreshToken
+        case general(data: Data?, urlResponse: URLResponse?)
+    }
+    
 }

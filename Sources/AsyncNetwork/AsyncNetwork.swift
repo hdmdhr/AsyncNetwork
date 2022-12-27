@@ -1,10 +1,9 @@
 import Foundation
 
 public protocol Authorizable {
-    var maxReAuthorizeTimes: Int { get }
+    var maxRetryLimit: Int { get }
     
-    @discardableResult
-    func authorize(urlRequest: inout URLRequest) -> Bool
+    func authorize(urlRequest: inout URLRequest) throws
     /// Optional. Only implement when you want to trigger re-authorize on failure.
     func shouldReAuthorize(data: Data, urlResponse: URLResponse) -> Bool
     /// Optional. Only implement when you need to support re-authorize on failure.
@@ -13,7 +12,7 @@ public protocol Authorizable {
 }
 
 public extension Authorizable {
-    var maxReAuthorizeTimes: Int { 1 }
+    var maxRetryLimit: Int { 1 }
     
     func shouldReAuthorize(data: Data, urlResponse: URLResponse) -> Bool { false }
     
@@ -71,17 +70,17 @@ public class HttpClient: HttpClientProtocol {
             urlRequest.setValue(header.value, forHTTPHeaderField: header.key)
         }
         
-        // authorize
-        if shouldAuthorize, let authorizer, !authorizer.authorize(urlRequest: &urlRequest) {
-            throw NetworkError.cannotAuthorize(data: nil, urlResponse: nil)
-        }
-        
         // add body data
         if case .command(_, let bodyDataProvider) = method {
             urlRequest.httpBody = bodyDataProvider?.bodyData
         }
         
         do {
+            // authorize
+            if shouldAuthorize, let authorizer {
+                try authorizer.authorize(urlRequest: &urlRequest)
+            }
+            
             let (data, urlResponse) = try await urlSession.data(for: urlRequest)
             
             // execute request custom handler first (if there is one)
@@ -89,29 +88,28 @@ public class HttpClient: HttpClientProtocol {
                 return try customHandler(data, urlResponse)
             }
             
-            // check if authorization failed (if there is an authorizer)
+            // if there is an authorizer, check if authorization failed
             if let authorizer, authorizer.shouldReAuthorize(data: data, urlResponse: urlResponse) {
                 var retryTimes = 0
                 var _data: Data = data
                 var _urlResponse: URLResponse = urlResponse
                 
-                /// repeat for `maxReAuthorizeTimes`
+                /// repeat for `maxRetryTimes`
                 /// 1. try to regain authorization
                 /// 2. authorize request
                 /// 3. fire request, try to decode response
                 /// before finally giving up and throw a `.cannotAuthorize` error
                 repeat {
                     try await authorizer.refresh(with: self)
-                    guard authorizer.authorize(urlRequest: &urlRequest) else { break }
+                    try authorizer.authorize(urlRequest: &urlRequest)
                     (_data, _urlResponse) = try await urlSession.data(for: urlRequest)
                     retryTimes += 1
                     if let res = try? decoder.decode(Response.self, from: _data) {
                         return res
                     }
-                } while retryTimes < authorizer.maxReAuthorizeTimes
-                && authorizer.shouldReAuthorize(data: _data, urlResponse: _urlResponse)
+                } while retryTimes < authorizer.maxRetryLimit && authorizer.shouldReAuthorize(data: _data, urlResponse: _urlResponse)
                 
-                throw NetworkError.cannotAuthorize(data: _data, urlResponse: _urlResponse)
+                throw NetworkError.Authorization.reachedMaxRetryLimit
             }
             
             // decode data and return
